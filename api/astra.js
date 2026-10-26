@@ -18,7 +18,8 @@ const MODELS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6.1-sol"];
 // di output[] — jadi output[] selalu diperiksa lebih dulu.
 function ekstrakTeks(data) {
   let teks = "";
-  if (Array.isArray(data.output)) {
+  if (typeof data.output === "string") teks = data.output.trim();
+  if (!teks && Array.isArray(data.output)) {
     teks = data.output.map(o => (o.content || []).map(c => c.text || "").join("")).join("").trim();
   }
   if (!teks && typeof data.output_text === "string") teks = data.output_text.trim();
@@ -26,6 +27,38 @@ function ekstrakTeks(data) {
     teks = String(data.choices[0].message.content || "").trim();
   }
   return teks;
+}
+
+// Baca balasan AgentRouter sebagai TEKS dulu, baru tafsirkan:
+// sebagian channel membalas SSE (stream "data: ...") walau tidak diminta —
+// JSON langsung akan gagal dibaca dan hasilnya objek kosong.
+function tafsirBalasan(mentah) {
+  const s = String(mentah || "");
+  if (s.trimStart().startsWith("data:")) {
+    let teksDelta = "";
+    let objekFinal = null;
+    for (const baris of s.split(/\r?\n/)) {
+      const b = baris.trim();
+      if (!b.startsWith("data:")) continue;
+      const isi = b.slice(5).trim();
+      if (!isi || isi === "[DONE]") continue;
+      try {
+        const ev = JSON.parse(isi);
+        if (ev.type === "response.output_text.delta" && typeof ev.delta === "string") teksDelta += ev.delta;
+        if (ev.response && typeof ev.response === "object") objekFinal = ev.response;
+      } catch (e) {}
+    }
+    if (objekFinal) return objekFinal;
+    if (teksDelta) return { output_text: teksDelta };
+    return {};
+  }
+  let data = {};
+  try { data = JSON.parse(s); } catch (e) { return {}; }
+  // Kadang terbungkus { data: {...} }
+  if (data && typeof data === "object" && data.data && typeof data.data === "object" && !data.output && !data.error && !data.choices) {
+    data = data.data;
+  }
+  return data || {};
 }
 
 async function panggilAgent(key, body) {
@@ -39,8 +72,8 @@ async function panggilAgent(key, body) {
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(50000),
   });
-  const data = await r.json().catch(() => ({}));
-  return { r, data };
+  const mentah = await r.text().catch(() => "");
+  return { r, data: tafsirBalasan(mentah), mentah };
 }
 
 module.exports = async function handler(req, res) {
@@ -59,32 +92,32 @@ module.exports = async function handler(req, res) {
   const system = String(req.body?.system || "").trim();
   const maxTokens = Math.min(2000, Math.max(64, Number(req.body?.maxTokens || 1000) || 1000));
 
-  const body = { model, input: prompt, max_output_tokens: maxTokens };
+  const body = { model, input: prompt, max_output_tokens: maxTokens, stream: false };
   if (system) body.instructions = system;
 
   try {
-    let { r, data } = await panggilAgent(key, body);
-    if (!r.ok) {
-      const msg = data?.error?.message || ("HTTP " + r.status);
-      return res.status(r.status).json({ ok: false, error: msg, model });
+    let hasil = await panggilAgent(key, body);
+    if (!hasil.r.ok) {
+      const msg = hasil.data?.error?.message || ("HTTP " + hasil.r.status + " " + String(hasil.mentah || "").slice(0, 120));
+      return res.status(hasil.r.status).json({ ok: false, error: msg, model });
     }
-    let text = ekstrakTeks(data);
+    let text = ekstrakTeks(hasil.data);
     if (!text) {
-      // Balasan 200 tapi kosong (biasanya token habis untuk reasoning) —
-      // coba sekali lagi dengan anggaran token lebih besar.
+      // Balasan 200 tapi kosong — coba sekali lagi dengan token lebih besar.
       const body2 = { ...body, max_output_tokens: Math.min(4000, maxTokens * 4) };
       const ulang = await panggilAgent(key, body2);
       if (ulang.r.ok) {
         const teks2 = ekstrakTeks(ulang.data);
-        if (teks2) { text = teks2; data = ulang.data; }
-        else data = ulang.data;
+        if (teks2) { text = teks2; hasil = ulang; }
+        else hasil = ulang;
       }
     }
     if (!text) {
-      const diag = "status " + (data && data.status ? data.status : "?")
-        + ", output " + (Array.isArray(data.output) ? data.output.length : 0) + " item"
-        + (data.usage ? ", token keluar " + data.usage.output_tokens : "");
-      return res.status(502).json({ ok: false, error: "Model membalas kosong (" + diag + ") — coba ulangi atau ganti model.", model });
+      const diag = "status " + (hasil.data && hasil.data.status ? hasil.data.status : "?")
+        + ", output " + (Array.isArray(hasil.data.output) ? hasil.data.output.length : 0) + " item"
+        + (hasil.data.usage ? ", token keluar " + hasil.data.usage.output_tokens : "")
+        + " | cuplikan: " + String(hasil.mentah || "").replace(/\s+/g, " ").slice(0, 200);
+      return res.status(502).json({ ok: false, error: "Model membalas kosong (" + diag + ")", model });
     }
     return res.status(200).json({ ok: true, text, model });
   } catch (e) {
