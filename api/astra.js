@@ -12,6 +12,37 @@ const AGENT_BASE = "https://agentrouter.org/v1";
 const AGENT_UA = "Cline/3.32.0";
 const MODELS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6.1-sol"];
 
+// Ekstraksi teks yang tahan variasi bentuk balasan antar-channel AgentRouter:
+// teks asli bisa di output[].content[].text, di output_text, atau ala chat.
+// PENTING: output_text kadang hadir sebagai string KOSONG padahal teksnya ada
+// di output[] — jadi output[] selalu diperiksa lebih dulu.
+function ekstrakTeks(data) {
+  let teks = "";
+  if (Array.isArray(data.output)) {
+    teks = data.output.map(o => (o.content || []).map(c => c.text || "").join("")).join("").trim();
+  }
+  if (!teks && typeof data.output_text === "string") teks = data.output_text.trim();
+  if (!teks && data.choices && data.choices[0] && data.choices[0].message) {
+    teks = String(data.choices[0].message.content || "").trim();
+  }
+  return teks;
+}
+
+async function panggilAgent(key, body) {
+  const r = await fetch(AGENT_BASE + "/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "authorization": "Bearer " + key,
+      "user-agent": AGENT_UA,
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(50000),
+  });
+  const data = await r.json().catch(() => ({}));
+  return { r, data };
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -32,26 +63,29 @@ module.exports = async function handler(req, res) {
   if (system) body.instructions = system;
 
   try {
-    const r = await fetch(AGENT_BASE + "/responses", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "authorization": "Bearer " + key,
-        "user-agent": AGENT_UA,
-      },
-      body: JSON.stringify(body),
-    });
-    const data = await r.json().catch(() => ({}));
+    let { r, data } = await panggilAgent(key, body);
     if (!r.ok) {
       const msg = data?.error?.message || ("HTTP " + r.status);
       return res.status(r.status).json({ ok: false, error: msg, model });
     }
-    let text = "";
-    if (typeof data.output_text === "string") text = data.output_text;
-    else if (Array.isArray(data.output)) {
-      text = data.output.map(o => (o.content || []).map(c => c.text || "").join("")).join("").trim();
+    let text = ekstrakTeks(data);
+    if (!text) {
+      // Balasan 200 tapi kosong (biasanya token habis untuk reasoning) —
+      // coba sekali lagi dengan anggaran token lebih besar.
+      const body2 = { ...body, max_output_tokens: Math.min(4000, maxTokens * 4) };
+      const ulang = await panggilAgent(key, body2);
+      if (ulang.r.ok) {
+        const teks2 = ekstrakTeks(ulang.data);
+        if (teks2) { text = teks2; data = ulang.data; }
+        else data = ulang.data;
+      }
     }
-    if (!text) text = "(Model membalas kosong — coba ulangi atau ganti model.)";
+    if (!text) {
+      const diag = "status " + (data && data.status ? data.status : "?")
+        + ", output " + (Array.isArray(data.output) ? data.output.length : 0) + " item"
+        + (data.usage ? ", token keluar " + data.usage.output_tokens : "");
+      return res.status(502).json({ ok: false, error: "Model membalas kosong (" + diag + ") — coba ulangi atau ganti model.", model });
+    }
     return res.status(200).json({ ok: true, text, model });
   } catch (e) {
     return res.status(502).json({ ok: false, error: "Relay gagal menghubungi AgentRouter: " + (e.message || String(e)), model });

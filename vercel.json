@@ -2,6 +2,9 @@
   "functions": {
     "api/*.js": {
       "maxDuration": 30
+    },
+    "api/astra.js": {
+      "maxDuration": 60
     }
   }
 }
